@@ -28,9 +28,6 @@ const SUPPORTED_IMAGE_TYPES = [
 
 // ─── PNG / JUMBF helpers ──────────────────────────────────────────────────────
 
-// Maximum thumbnail height in pixels (matches Tailwind's max-h-80 = 320px)
-const THUMBNAIL_MAX_HEIGHT = 320;
-
 // Human-readable PNG color type names (IHDR byte 17)
 const PNG_COLOR_TYPES: Record<number, string> = {
   0: 'Grayscale',
@@ -587,7 +584,7 @@ export default function ImageMetadataViewer() {
   } | null>(null);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const thumbContainerRef = useRef<HTMLDivElement>(null);
+  const thumbImgRef = useRef<HTMLImageElement>(null);
 
   const processFile = useCallback(async (file: File) => {
     setLoading(true);
@@ -764,23 +761,39 @@ export default function ImageMetadataViewer() {
     setLoading(false);
   }, [imageUrl]);
 
-  const handleThumbLoad = useCallback((e: React.SyntheticEvent<HTMLImageElement>) => {
-    const img = e.currentTarget;
-    const container = thumbContainerRef.current;
-    if (!container || img.naturalWidth === 0) return;
-
-    const cW = container.offsetWidth;
-    const MAX_H = THUMBNAIL_MAX_HEIGHT;
-    const aspectH = cW * (img.naturalHeight / img.naturalWidth);
-
-    if (aspectH <= MAX_H) {
-      setThumbBounds({ imgW: cW, imgH: aspectH, imgLeft: 0, imgTop: 0 });
-    } else {
-      const imgH = MAX_H;
-      const imgW = MAX_H * (img.naturalWidth / img.naturalHeight);
-      setThumbBounds({ imgW, imgH, imgLeft: (cW - imgW) / 2, imgTop: 0 });
-    }
+  // Compute and store the rendered bounds of the image content (inside the
+  // element box that may be wider/taller than the actual pixels due to
+  // object-fit:contain + max-height).  Reading clientWidth/clientHeight from
+  // the live DOM element avoids relying on a hard-coded pixel constant and
+  // therefore works correctly regardless of the user's browser font size.
+  const calcThumbBounds = useCallback((img: HTMLImageElement) => {
+    if (img.naturalWidth === 0) return;
+    const elemW = img.clientWidth;
+    const elemH = img.clientHeight;
+    if (elemW === 0 || elemH === 0) return;
+    const scale = Math.min(elemW / img.naturalWidth, elemH / img.naturalHeight);
+    const imgW = img.naturalWidth * scale;
+    const imgH = img.naturalHeight * scale;
+    setThumbBounds({
+      imgW,
+      imgH,
+      imgLeft: (elemW - imgW) / 2,
+      imgTop:  (elemH - imgH) / 2,
+    });
   }, []);
+
+  const handleThumbLoad = useCallback((e: React.SyntheticEvent<HTMLImageElement>) => {
+    calcThumbBounds(e.currentTarget);
+  }, [calcThumbBounds]);
+
+  // Re-calculate whenever the image element is resized (e.g. window resize).
+  useEffect(() => {
+    const img = thumbImgRef.current;
+    if (!img) return;
+    const observer = new ResizeObserver(() => calcThumbBounds(img));
+    observer.observe(img);
+    return () => observer.disconnect();
+  }, [imageUrl, calcThumbBounds]);
 
   useEffect(() => {
     if (!lightboxOpen) return;
@@ -874,11 +887,11 @@ export default function ImageMetadataViewer() {
             >
               {/* Inner container: rounded corners + overflow clip */}
               <div
-                ref={thumbContainerRef}
                 className="shadow-lg rounded-xl overflow-hidden bg-gray-100"
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
+                  ref={thumbImgRef}
                   src={imageUrl}
                   alt={imageName}
                   className="w-full h-auto object-contain max-h-80 block"
