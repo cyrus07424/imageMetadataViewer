@@ -1,7 +1,6 @@
 'use client';
 
-import { useState, useRef, useCallback, DragEvent } from 'react';
-import Image from 'next/image';
+import { useState, useRef, useCallback, useEffect, DragEvent } from 'react';
 import dynamic from 'next/dynamic';
 
 // Dynamically import MapModal to avoid SSR issues with Leaflet
@@ -28,6 +27,9 @@ const SUPPORTED_IMAGE_TYPES = [
 ];
 
 // ─── PNG / JUMBF helpers ──────────────────────────────────────────────────────
+
+// Maximum thumbnail height in pixels (matches Tailwind's max-h-80 = 320px)
+const THUMBNAIL_MAX_HEIGHT = 320;
 
 // Human-readable PNG color type names (IHDR byte 17)
 const PNG_COLOR_TYPES: Record<number, string> = {
@@ -313,6 +315,17 @@ type MetadataEntry = {
   lng?: number;
 };
 
+// Normalized (0–1) region from XMP RegionInfo / Regions metadata
+type ImageRegion = {
+  name: string;
+  type?: string;
+  description?: string;
+  x: number; // center x
+  y: number; // center y
+  w: number; // width
+  h: number; // height
+};
+
 function formatValue(val: unknown): string {
   if (val === null || val === undefined) return '';
   if (val instanceof Date) return val.toLocaleString('ja-JP');
@@ -450,6 +463,56 @@ const LABEL_MAP: Record<string, string> = {
   RawHeader: 'ファイルヘッダー (Hex)',
 };
 
+// Extract image regions from XMP RegionInfo / Regions metadata (MWG standard)
+function extractImageRegions(raw: Record<string, Record<string, unknown>> | null | undefined): ImageRegion[] {
+  if (!raw) return [];
+  const xmp = raw.xmp;
+  if (!xmp || typeof xmp !== 'object') return [];
+
+  const regionInfoRaw =
+    (xmp as Record<string, unknown>).RegionInfo ??
+    (xmp as Record<string, unknown>).Regions;
+  if (!regionInfoRaw || typeof regionInfoRaw !== 'object' || Array.isArray(regionInfoRaw)) return [];
+  const regionInfo = regionInfoRaw as Record<string, unknown>;
+
+  const regionList = regionInfo.RegionList;
+  if (!Array.isArray(regionList)) return [];
+
+  const result: ImageRegion[] = [];
+  for (const item of regionList) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const r = item as Record<string, unknown>;
+
+    const areaRaw = r.Area;
+    if (!areaRaw || typeof areaRaw !== 'object' || Array.isArray(areaRaw)) continue;
+    const area = areaRaw as Record<string, unknown>;
+
+    // Only handle normalized coordinates (0–1 fractions)
+    const unit = area.unit;
+    if (unit !== undefined && unit !== 'normalized') continue;
+
+    const toNum = (v: unknown) => (typeof v === 'number' ? v : parseFloat(String(v)));
+    const x = toNum(area.x);
+    const y = toNum(area.y);
+    const w = toNum(area.w);
+    const h = toNum(area.h);
+
+    if ([x, y, w, h].some(isNaN)) continue;
+    if (x < 0 || x > 1 || y < 0 || y > 1 || w <= 0 || w > 1 || h <= 0 || h > 1) continue;
+
+    result.push({
+      name: typeof r.Name === 'string' ? r.Name : '',
+      type: typeof r.Type === 'string' ? r.Type : undefined,
+      description: typeof r.Description === 'string' ? r.Description : undefined,
+      x,
+      y,
+      w,
+      h,
+    });
+  }
+  return result;
+}
+
 function getLabel(key: string): string {
   return LABEL_MAP[key] || key;
 }
@@ -464,13 +527,25 @@ export default function ImageMetadataViewer() {
   const [error, setError] = useState<string | null>(null);
   const [mapGps, setMapGps] = useState<{ lat: number; lng: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [regions, setRegions] = useState<ImageRegion[]>([]);
+  const [thumbBounds, setThumbBounds] = useState<{
+    imgW: number;
+    imgH: number;
+    imgLeft: number;
+    imgTop: number;
+  } | null>(null);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const thumbContainerRef = useRef<HTMLDivElement>(null);
 
   const processFile = useCallback(async (file: File) => {
     setLoading(true);
     setError(null);
     setMetadata([]);
     setMapGps(null);
+    setRegions([]);
+    setThumbBounds(null);
+    setLightboxOpen(false);
 
     // Revoke previous object URL
     if (imageUrl) URL.revokeObjectURL(imageUrl);
@@ -622,6 +697,7 @@ export default function ImageMetadataViewer() {
       }
 
       setMetadata(entries);
+      setRegions(extractImageRegions(raw as Record<string, Record<string, unknown>> | null));
     } catch (err) {
       console.error('Metadata parsing error:', err);
       setError('メタデータの読み取りに失敗しました。このファイルにはメタデータが含まれていない可能性があります。');
@@ -629,6 +705,33 @@ export default function ImageMetadataViewer() {
 
     setLoading(false);
   }, [imageUrl]);
+
+  const handleThumbLoad = useCallback((e: React.SyntheticEvent<HTMLImageElement>) => {
+    const img = e.currentTarget;
+    const container = thumbContainerRef.current;
+    if (!container || img.naturalWidth === 0) return;
+
+    const cW = container.offsetWidth;
+    const MAX_H = THUMBNAIL_MAX_HEIGHT;
+    const aspectH = cW * (img.naturalHeight / img.naturalWidth);
+
+    if (aspectH <= MAX_H) {
+      setThumbBounds({ imgW: cW, imgH: aspectH, imgLeft: 0, imgTop: 0 });
+    } else {
+      const imgH = MAX_H;
+      const imgW = MAX_H * (img.naturalWidth / img.naturalHeight);
+      setThumbBounds({ imgW, imgH, imgLeft: (cW - imgW) / 2, imgTop: 0 });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!lightboxOpen) return;
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setLightboxOpen(false);
+    };
+    document.addEventListener('keydown', handleKey);
+    return () => document.removeEventListener('keydown', handleKey);
+  }, [lightboxOpen]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -705,15 +808,53 @@ export default function ImageMetadataViewer() {
         {/* Thumbnail */}
         {imageUrl && !loading && (
           <div className="mt-6 flex flex-col items-center">
-            <div className="relative max-w-sm w-full shadow-lg rounded-xl overflow-hidden bg-gray-100">
-              <Image
-                src={imageUrl}
-                alt={imageName}
-                width={480}
-                height={360}
-                className="w-full h-auto object-contain max-h-80"
-                unoptimized
-              />
+            {/* Outer wrapper is the positioning root for the overlay */}
+            <div
+              className="relative max-w-sm w-full cursor-pointer"
+              onClick={() => setLightboxOpen(true)}
+              title="クリックして拡大表示"
+            >
+              {/* Inner container: rounded corners + overflow clip */}
+              <div
+                ref={thumbContainerRef}
+                className="shadow-lg rounded-xl overflow-hidden bg-gray-100"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={imageUrl}
+                  alt={imageName}
+                  className="w-full h-auto object-contain max-h-80 block"
+                  onLoad={handleThumbLoad}
+                />
+              </div>
+
+              {/* Region overlays – outside overflow:hidden so tooltips are never clipped */}
+              {regions.length > 0 && thumbBounds !== null && (
+                <div className="absolute inset-0 pointer-events-none">
+                  {regions.map((region, i) => {
+                    const left = thumbBounds.imgLeft + (region.x - region.w / 2) * thumbBounds.imgW;
+                    const top  = thumbBounds.imgTop  + (region.y - region.h / 2) * thumbBounds.imgH;
+                    const width  = region.w * thumbBounds.imgW;
+                    const height = region.h * thumbBounds.imgH;
+                    const tooltipText = [
+                      region.name,
+                      region.type ? `[${region.type}]` : null,
+                      region.description,
+                    ].filter(Boolean).join(' ') || '領域';
+                    return (
+                      <div
+                        key={i}
+                        className="absolute border-2 border-yellow-400 pointer-events-auto group"
+                        style={{ left, top, width, height }}
+                      >
+                        <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 px-2 py-1 bg-black/80 text-white text-xs rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity z-10 pointer-events-none">
+                          {tooltipText}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
             <p className="mt-2 text-gray-500 text-sm">{imageName}</p>
 
@@ -803,6 +944,66 @@ export default function ImageMetadataViewer() {
           lng={mapGps.lng}
           onClose={() => setMapGps(null)}
         />
+      )}
+
+      {/* Lightbox – full-size image viewer */}
+      {lightboxOpen && imageUrl && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80"
+          onClick={() => setLightboxOpen(false)}
+        >
+          {/* Close button */}
+          <button
+            className="absolute top-4 right-4 text-white text-3xl leading-none hover:text-gray-300 transition-colors z-10"
+            onClick={(e) => { e.stopPropagation(); setLightboxOpen(false); }}
+            aria-label="閉じる"
+          >
+            ✕
+          </button>
+
+          {/* Image + overlays (stop click from closing when clicking image) */}
+          <div
+            className="relative"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={imageUrl}
+              alt={imageName}
+              className="block"
+              style={{ maxWidth: '90vw', maxHeight: '90vh' }}
+            />
+
+            {/* Region overlays – percentage-based; container matches rendered image exactly */}
+            {regions.length > 0 && (
+              <div className="absolute inset-0 pointer-events-none">
+                {regions.map((region, i) => {
+                  const tooltipText = [
+                    region.name,
+                    region.type ? `[${region.type}]` : null,
+                    region.description,
+                  ].filter(Boolean).join(' ') || '領域';
+                  return (
+                    <div
+                      key={i}
+                      className="absolute border-2 border-yellow-400 pointer-events-auto group"
+                      style={{
+                        left:   `${(region.x - region.w / 2) * 100}%`,
+                        top:    `${(region.y - region.h / 2) * 100}%`,
+                        width:  `${region.w * 100}%`,
+                        height: `${region.h * 100}%`,
+                      }}
+                    >
+                      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 px-2 py-1 bg-black/80 text-white text-xs rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity z-10 pointer-events-none">
+                        {tooltipText}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </div>
   );
