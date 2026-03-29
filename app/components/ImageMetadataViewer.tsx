@@ -513,6 +513,57 @@ function extractImageRegions(raw: Record<string, Record<string, unknown>> | null
   return result;
 }
 
+// Return numeric EXIF orientation (1–8, default 1 = normal) from raw parsed metadata.
+// exifr may return the value as a number or as a translated string depending on options.
+function getExifOrientation(raw: Record<string, Record<string, unknown>> | null | undefined): number {
+  if (!raw) return 1;
+  const o =
+    (raw.tiff as Record<string, unknown> | undefined)?.Orientation ??
+    (raw.exif as Record<string, unknown> | undefined)?.Orientation;
+  if (typeof o === 'number' && o >= 1 && o <= 8) return o;
+  if (typeof o === 'string') {
+    // Match the translated strings that exifr emits (case-insensitive).
+    // Ordered from most specific to least specific to avoid false matches.
+    const s = o.toLowerCase();
+    if (s.includes('mirror horizontal') && s.includes('270')) return 5;
+    if (s.includes('mirror horizontal') && s.includes('90'))  return 7;
+    if (s.includes('mirror horizontal')) return 2;
+    if (s.includes('mirror vertical'))   return 4;
+    if (s.includes('270') || s.includes('ccw')) return 8;  // "Rotate 270 CW" = 90 CCW
+    if (s.includes('90'))  return 6;
+    if (s.includes('180')) return 3;
+  }
+  return 1;
+}
+
+// Transform a region's center-based coordinates from stored-pixel space into the
+// display space defined by the EXIF orientation tag.  This is needed because XMP
+// region coordinates are recorded relative to the raw pixel grid while browsers
+// display the image after applying the EXIF rotation.
+//
+// Transformation derivations (normalized center coordinates, width/height):
+//   1 – normal          : no change
+//   2 – mirror H        : x' = 1-x
+//   3 – rotate 180°     : x' = 1-x,   y' = 1-y
+//   4 – mirror V        : y' = 1-y
+//   5 – transpose       : x' = y,     y' = x,   w/h swap
+//   6 – rotate 90° CW   : x' = 1-y,   y' = x,   w/h swap
+//   7 – transverse      : x' = 1-y,   y' = 1-x, w/h swap
+//   8 – rotate 90° CCW  : x' = y,     y' = 1-x, w/h swap
+function transformRegionForOrientation(region: ImageRegion, orientation: number): ImageRegion {
+  const { x, y, w, h } = region;
+  switch (orientation) {
+    case 2: return { ...region, x: 1 - x };
+    case 3: return { ...region, x: 1 - x, y: 1 - y };
+    case 4: return { ...region, y: 1 - y };
+    case 5: return { ...region, x: y, y: x, w: h, h: w };
+    case 6: return { ...region, x: 1 - y, y: x, w: h, h: w };
+    case 7: return { ...region, x: 1 - y, y: 1 - x, w: h, h: w };
+    case 8: return { ...region, x: y, y: 1 - x, w: h, h: w };
+    default: return region;  // 1 = normal, no transform
+  }
+}
+
 function getLabel(key: string): string {
   return LABEL_MAP[key] || key;
 }
@@ -697,7 +748,14 @@ export default function ImageMetadataViewer() {
       }
 
       setMetadata(entries);
-      setRegions(extractImageRegions(raw as Record<string, Record<string, unknown>> | null));
+      const rawTyped = raw as Record<string, Record<string, unknown>> | null;
+      const orientation = getExifOrientation(rawTyped);
+      const extractedRegions = extractImageRegions(rawTyped);
+      setRegions(
+        orientation !== 1
+          ? extractedRegions.map((r) => transformRegionForOrientation(r, orientation))
+          : extractedRegions,
+      );
     } catch (err) {
       console.error('Metadata parsing error:', err);
       setError('メタデータの読み取りに失敗しました。このファイルにはメタデータが含まれていない可能性があります。');
